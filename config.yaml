@@ -1,0 +1,22 @@
+# OSB Checker Configuration for Spec 2.17
+# Kopiere diese Datei und passe sie an deinen Broker an
+
+# Broker URL (ohne trailing slash)
+broker_url: "http://localhost:8080"
+
+# Optional: Basic Auth Credentials
+username: ""
+password: ""
+
+# API Version (immer 2.17 für diese Spec)
+api_version: "2.17"
+
+# Asynchrone Operationen unterstützen
+accepts_async: true
+
+# Test-Kategorien aktivieren/deaktivieren
+test_catalog: true
+test_provision: true
+test_bind: true
+test_update: true
+test_fetch: true
