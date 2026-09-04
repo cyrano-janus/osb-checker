@@ -1,20 +1,63 @@
-# OSB Checker Configuration for Spec 2.17
-# Kopiere diese Datei und passe sie an deinen Broker an
+# OSB Checker — Vorlage. Kopieren nach configs/config.yaml und anpassen.
+#
+#   cp config.yaml configs/config.yaml
+#
+# configs/ ist gitignoriert: dort stehen echte Zugangsdaten.
+# Jeder Schlüssel darf fehlen — dann gilt der hier gezeigte Standardwert.
 
-# Broker URL (ohne trailing slash)
+# Broker-URL, ohne Schrägstrich am Ende. Pflichtangabe.
 broker_url: "http://localhost:8080"
 
-# Optional: Basic Auth Credentials
+# Basic Auth. Leer heißt: kein Authorization-Header.
+# In einer CI besser über OSB_USERNAME / OSB_PASSWORD setzen — Umgebungs-
+# variablen überschreiben diese Datei.
 username: ""
 password: ""
 
-# API Version (immer 2.17 für diese Spec)
+# Wert des X-Broker-API-Version-Headers.
 api_version: "2.17"
 
-# Asynchrone Operationen unterstützen
+# Schickt accepts_incomplete=true als Query-Parameter. Der Broker darf dann
+# mit 202 antworten; der Checker pollt last_operation bis zum Abschluss.
+# Auf false gesetzt, muss der Broker synchron antworten.
 accepts_async: true
+poll_timeout_seconds: 300
 
-# Test-Kategorien aktivieren/deaktivieren
+# WAS geprüft wird. Ohne Vorgabe nimmt der Checker den ersten Service des
+# Katalogs, der nicht in skip_services steht und mindestens einen Plan hat.
+#
+# Vorgeben ist der Regelfall: welcher Service im Katalog vorn steht, ist keine
+# Zusage des Brokers, und ein Bericht über den falschen Service sagt nichts.
+service_id: ""
+plan_id: ""
+
+# Angebote, die bei der automatischen Wahl übergangen werden — etwa Demo-
+# Services, die ein Broker zu Anschauungszwecken mitliefert.
+skip_services: []
+
+# Geht in jede erzeugte Instanz- und Binding-ID ein. Zwei gleichzeitige Läufe
+# gegen denselben Broker dürfen sich nicht auf dieselbe Instanz setzen.
+id_prefix: "osb-checker"
+
+# Zeitschranke je HTTP-Request. Ohne sie hängt ein Lauf an einem stummen
+# Broker unbegrenzt.
+timeout_seconds: 30
+
+# Bildet einen Hostnamen auf eine Adresse ab, wie curls --resolve:
+# "host:port:adresse". Für einen Broker hinter kubectl port-forward: das
+# Zertifikat lautet auf den Service-Namen, erreichbar ist er über localhost.
+# Damit bleibt die Zertifikatsprüfung an, statt sie abzuschalten.
+resolve: ""
+
+# TLS. ca_cert prüft das Broker-Zertifikat gegen eine eigene CA,
+# client_cert/client_key weisen den Checker per mTLS aus.
+# insecure schaltet die Prüfung ab — nur zum Eingrenzen, nie in einer CI.
+ca_cert: ""
+client_cert: ""
+client_key: ""
+insecure: false
+
+# Test-Kategorien.
 test_catalog: true
 test_provision: true
 test_bind: true

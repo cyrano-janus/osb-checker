@@ -7,14 +7,14 @@ type Catalog struct {
 
 // Service represents a service offering
 type Service struct {
-	ID          string        `json:"id"`
-	Name        string        `json:"name"`
-	Description string        `json:"description"`
-	Bindable    bool          `json:"bindable"`
-	Plans       []ServicePlan `json:"plans"`
+	ID          string           `json:"id"`
+	Name        string           `json:"name"`
+	Description string           `json:"description"`
+	Bindable    bool             `json:"bindable"`
+	Plans       []ServicePlan    `json:"plans"`
 	Metadata    *ServiceMetadata `json:"metadata,omitempty"`
-	Tags        []string      `json:"tags,omitempty"`
-	Requires    []string      `json:"requires,omitempty"`
+	Tags        []string         `json:"tags,omitempty"`
+	Requires    []string         `json:"requires,omitempty"`
 }
 
 // ServicePlan represents a service plan
@@ -62,9 +62,9 @@ type InputOutputSchema struct {
 
 // GetInstanceResponse represents a get instance response
 type GetInstanceResponse struct {
-	ServiceID    string `json:"service_id"`
-	PlanID       string `json:"plan_id"`
-	DashboardURL string `json:"dashboard_url,omitempty"`
+	ServiceID    string                 `json:"service_id"`
+	PlanID       string                 `json:"plan_id"`
+	DashboardURL string                 `json:"dashboard_url,omitempty"`
 	Parameters   map[string]interface{} `json:"parameters,omitempty"`
 	StatusCode   int
 }

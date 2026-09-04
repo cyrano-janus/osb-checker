@@ -1,0 +1,11 @@
+# Die echte Konfiguration traegt Zugangsdaten des geprueften Brokers.
+# Vorlage ist config.yaml im Wurzelverzeichnis.
+configs/
+
+# Gebautes Binary
+osb-checker
+
+# Zertifikatsmaterial fuer TLS-Laeufe
+*.pem
+*.key
+*.crt

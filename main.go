@@ -6,31 +6,52 @@ import (
 	"log"
 	"os"
 
-	"github.com/example/osb-checker/test"
-	"github.com/example/osb-checker/test/config"
+	"github.com/cyrano-janus/osb-checker/test"
+	"github.com/cyrano-janus/osb-checker/test/config"
 )
+
+// version wird beim Release ueber -ldflags gesetzt.
+var version = "dev"
 
 func main() {
 	configFile := flag.String("f", "configs/config.yaml", "Path to configuration file")
 	verbose := flag.Bool("v", false, "Enable verbose output")
+	showVersion := flag.Bool("version", false, "Print the version and exit")
 	flag.Parse()
 
-	// Load configuration
+	if *showVersion {
+		fmt.Printf("osb-checker %s\n", version)
+		return
+	}
+
 	cfg, err := config.LoadConfig(*configFile)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// Create test suite
-	suite := test.NewTestSuite(cfg, *verbose)
+	// Was geprueft wird, gehoert in die Ausgabe: sonst laesst sich ein
+	// gruener Bericht nicht von einem unterscheiden, der gegen den falschen
+	// Broker oder den falschen Service lief.
+	fmt.Printf("osb-checker %s -> %s (OSB %s", version, cfg.BrokerURL, cfg.APIVersion)
+	if cfg.ServiceID != "" {
+		fmt.Printf(", service %s", cfg.ServiceID)
+	}
+	if cfg.AcceptsAsync {
+		fmt.Print(", async")
+	}
+	fmt.Println(")")
+	if cfg.Insecure {
+		fmt.Fprintln(os.Stderr, "osb-checker: WARNING insecure=true disables broker certificate verification; never use this in CI")
+	}
 
-	// Run all tests
+	suite, err := test.NewTestSuite(cfg, *verbose)
+	if err != nil {
+		log.Fatalf("Failed to build test suite: %v", err)
+	}
+
 	results := suite.Run()
-
-	// Print results
 	printResults(results)
 
-	// Exit with appropriate code
 	if results.Failed > 0 {
 		os.Exit(1)
 	}

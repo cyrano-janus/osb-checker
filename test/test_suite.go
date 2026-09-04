@@ -1,31 +1,33 @@
 package test
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"net/http"
 
-	"github.com/example/osb-checker/test/config"
+	"github.com/cyrano-janus/osb-checker/test/config"
+	"github.com/cyrano-janus/osb-checker/test/models"
 )
 
-// NewTestSuite creates a new test suite
-func NewTestSuite(cfg *config.Config, verbose bool) *TestSuite {
-	client := NewOSBClient(cfg.BrokerURL, cfg.Username, cfg.Password, cfg.APIVersion)
-	
-	return &TestSuite{
-		config: &Config{
-			BrokerURL:     cfg.BrokerURL,
-			Username:      cfg.Username,
-			Password:      cfg.Password,
-			APIVersion:    cfg.APIVersion,
-			AcceptsAsync:  cfg.AcceptsAsync,
-			TestCatalog:   cfg.TestCatalog,
-			TestProvision: cfg.TestProvision,
-			TestBind:      cfg.TestBind,
-			TestUpdate:    cfg.TestUpdate,
-			TestFetch:     cfg.TestFetch,
-		},
-		verbose: verbose,
-		client:  client,
+// NewTestSuite creates a new test suite.
+func NewTestSuite(cfg *config.Config, verbose bool) (*TestSuite, error) {
+	client, err := NewOSBClient(cfg)
+	if err != nil {
+		return nil, err
 	}
+	return &TestSuite{config: cfg, verbose: verbose, client: client}, nil
+}
+
+// runID trennt gleichzeitige Laeufe voneinander. Zwei CI-Jobs gegen denselben
+// Broker duerfen sich nicht auf dieselbe Instanz setzen - vorher waren die IDs
+// aus der Service-ID abgeleitet und damit fuer jeden Lauf gleich.
+func runID() string {
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil {
+		return "fixed"
+	}
+	return hex.EncodeToString(b)
 }
 
 // Run executes all tests
@@ -62,8 +64,9 @@ func (s *TestSuite) Run() *TestResults {
 		s.runFetchTests(results, state)
 	}
 
-	// Cleanup
-	if state.InstanceID != "" && state.BindingID != "" {
+	// Aufgeraeumt wird, was entstanden ist - unabhaengig davon, wie weit der
+	// Lauf gekommen ist.
+	if len(state.CreatedInstances) > 0 || len(state.CreatedBindings) > 0 {
 		s.cleanup(results, state)
 	}
 
@@ -118,33 +121,137 @@ func (s *TestSuite) runFetchTests(results *TestResults, state *TestState) {
 	s.testLastOperation(results, state)
 }
 
+// cleanup raeumt jede Instanz und jedes Binding ab, das im Lauf wirklich
+// entstanden ist.
+//
+// Zwei Dinge waren hier falsch: aufgeraeumt wurde nur, wenn sowohl Instanz als
+// auch Binding existierten - lief der Bind-Teil nicht, blieb die Instanz
+// stehen. Und ein gescheitertes Aufraeumen wurde nur bei -v gedruckt und nie
+// gezaehlt, sodass ein Broker, der nicht deprovisionieren kann, "alle Tests
+// bestanden" meldete.
 func (s *TestSuite) cleanup(results *TestResults, state *TestState) {
 	if s.verbose {
 		fmt.Println("\nCleaning up test resources...")
 	}
 
-	// Unbind
-	if state.BindingID != "" {
-		_, err := s.client.UnbindInstance(state.InstanceID, state.BindingID, state.ServiceID, state.PlanID)
-		if err != nil && s.verbose {
-			fmt.Printf("Warning: Failed to unbind: %v\n", err)
+	for _, b := range state.CreatedBindings {
+		if _, err := s.client.UnbindInstance(b.InstanceID, b.BindingID, state.ServiceID, state.PlanID); err != nil {
+			s.recordFailure(results, "Cleanup: unbind", "cleanup", err.Error(),
+				"/v2/service_instances/"+b.InstanceID+"/service_bindings/"+b.BindingID, "DELETE")
+		} else {
+			s.recordSuccess(results, "Cleanup: unbind "+b.BindingID, "cleanup")
 		}
 	}
 
-	// Deprovision
-	if state.InstanceID != "" {
-		_, err := s.client.DeprovisionInstance(state.InstanceID, state.ServiceID, state.PlanID)
-		if err != nil && s.verbose {
-			fmt.Printf("Warning: Failed to deprovision: %v\n", err)
+	for _, id := range state.CreatedInstances {
+		if _, err := s.client.DeprovisionInstance(id, state.ServiceID, state.PlanID); err != nil {
+			s.recordFailure(results, "Cleanup: deprovision", "cleanup", err.Error(),
+				"/v2/service_instances/"+id, "DELETE")
+			continue
 		}
+		if s.client.AcceptsAsync() {
+			// Ein asynchrones Deprovision ist erst fertig, wenn
+			// last_operation es sagt. Wer hier nicht wartet, laesst
+			// moeglicherweise eine halb abgeraeumte Instanz zurueck.
+			if _, err := s.client.WaitForOperation(id, "", ""); err != nil && s.verbose {
+				fmt.Printf("Warning: deprovision of %s did not settle: %v\n", id, err)
+			}
+		}
+		s.recordSuccess(results, "Cleanup: deprovision "+id, "cleanup")
 	}
+}
+
+// recordSuccess und recordFailure buchen ein Ergebnis.
+func (s *TestSuite) recordSuccess(results *TestResults, name, category string) {
+	results.Passed++
+	results.Successes = append(results.Successes, TestResult{TestName: name, Category: category})
+}
+
+func (s *TestSuite) recordFailure(results *TestResults, name, category, msg, endpoint, method string) {
+	results.Failed++
+	results.Failures = append(results.Failures, TestFailure{
+		TestName: name, Category: category, Error: msg, Endpoint: endpoint, Method: method,
+	})
+}
+
+// isClientError prueft auf 4xx.
+//
+// Vorher stand hier >= 400, der Kommentar sprach aber von 400-499: ein Broker,
+// der bei einer fehlenden service_id mit 500 abstuerzt, bestand den Test.
+func isClientError(status int) bool { return status >= 400 && status < 500 }
+
+// pickService waehlt Service und Plan.
+//
+// Vorgabe hat Vorrang und muss aufgehen; ein unbekannter Wert ist ein
+// Fehlschlag und kein stiller Rueckfall, sonst prueft ein CI-Lauf klaglos
+// etwas anderes als gemeint. Ohne Vorgabe faellt die Wahl auf den ersten
+// Service, der nicht in skip_services steht und mindestens einen Plan hat -
+// welcher Service im Katalog vorn steht, ist keine Zusage des Brokers.
+func (s *TestSuite) pickService(results *TestResults, state *TestState) {
+	const name = "Service selection"
+	svcs := state.Catalog.Services
+
+	if s.config.ServiceID != "" {
+		for _, svc := range svcs {
+			if svc.ID != s.config.ServiceID {
+				continue
+			}
+			plan, err := selectPlan(svc, s.config.PlanID)
+			if err != nil {
+				s.recordFailure(results, name, "catalog", err.Error(), "/v2/catalog", "GET")
+				return
+			}
+			state.ServiceID, state.PlanID = svc.ID, plan
+			s.recordSuccess(results, fmt.Sprintf("%s: %s / %s (configured)", name, svc.Name, plan), "catalog")
+			return
+		}
+		s.recordFailure(results, name, "catalog",
+			fmt.Sprintf("service_id %q is not in the catalog", s.config.ServiceID), "/v2/catalog", "GET")
+		return
+	}
+
+	skip := make(map[string]bool, len(s.config.SkipServices))
+	for _, id := range s.config.SkipServices {
+		skip[id] = true
+	}
+	for _, svc := range svcs {
+		if skip[svc.ID] {
+			continue
+		}
+		plan, err := selectPlan(svc, "")
+		if err != nil {
+			continue
+		}
+		state.ServiceID, state.PlanID = svc.ID, plan
+		s.recordSuccess(results, fmt.Sprintf("%s: %s / %s (first eligible)", name, svc.Name, plan), "catalog")
+		return
+	}
+	s.recordFailure(results, name, "catalog", "no service with at least one plan", "/v2/catalog", "GET")
+}
+
+// selectPlan liefert den gewuenschten Plan oder den ersten des Service.
+func selectPlan(svc models.Service, wanted string) (string, error) {
+	if wanted != "" {
+		for _, p := range svc.Plans {
+			if p.ID == wanted {
+				return p.ID, nil
+			}
+		}
+		return "", fmt.Errorf("plan_id %q does not belong to service %q", wanted, svc.ID)
+	}
+	// Ohne diese Pruefung lief Plans[0] in einen Index-Panic, sobald ein
+	// Service ohne Plaene im Katalog stand.
+	if len(svc.Plans) == 0 {
+		return "", fmt.Errorf("service %q offers no plan", svc.ID)
+	}
+	return svc.Plans[0].ID, nil
 }
 
 // Test helpers - Catalog tests
 
 func (s *TestSuite) testCatalogExists(results *TestResults, state *TestState) {
 	testName := "Catalog endpoint exists and returns valid JSON"
-	
+
 	catalog, err := s.client.GetCatalog()
 	if err != nil {
 		results.Failed++
@@ -168,7 +275,7 @@ func (s *TestSuite) testCatalogExists(results *TestResults, state *TestState) {
 
 func (s *TestSuite) testCatalogHasServices(results *TestResults, state *TestState) {
 	testName := "Catalog contains at least one service"
-	
+
 	if state.Catalog == nil || len(state.Catalog.Services) == 0 {
 		results.Failed++
 		results.Failures = append(results.Failures, TestFailure{
@@ -181,9 +288,7 @@ func (s *TestSuite) testCatalogHasServices(results *TestResults, state *TestStat
 		return
 	}
 
-	// Select first service and plan for subsequent tests
-	state.ServiceID = state.Catalog.Services[0].ID
-	state.PlanID = state.Catalog.Services[0].Plans[0].ID
+	s.pickService(results, state)
 
 	results.Passed++
 	results.Successes = append(results.Successes, TestResult{
@@ -194,7 +299,7 @@ func (s *TestSuite) testCatalogHasServices(results *TestResults, state *TestStat
 
 func (s *TestSuite) testCatalogServiceStructure(results *TestResults, state *TestState) {
 	testName := "Service has required fields (id, name, description, plans)"
-	
+
 	if state.Catalog == nil || len(state.Catalog.Services) == 0 {
 		results.Skipped++
 		return
@@ -222,7 +327,7 @@ func (s *TestSuite) testCatalogServiceStructure(results *TestResults, state *Tes
 
 func (s *TestSuite) testCatalogPlanStructure(results *TestResults, state *TestState) {
 	testName := "Plan has required fields (id, name, description)"
-	
+
 	if state.Catalog == nil || len(state.Catalog.Services) == 0 {
 		results.Skipped++
 		return
@@ -251,46 +356,55 @@ func (s *TestSuite) testCatalogPlanStructure(results *TestResults, state *TestSt
 // Test helpers - Provision tests
 
 func (s *TestSuite) testProvisionSuccess(results *TestResults, state *TestState) {
-	testName := "Provision returns 201 Created"
-	
-	instanceID := "test-instance-" + state.ServiceID[:8]
+	testName := "Provision accepted (201 or 202)"
+
+	// Die ID traegt den Praefix aus der Konfiguration und eine Zufallszahl.
+	// Frueher stand hier state.ServiceID[:8] - das ergab fuer jeden Lauf
+	// dieselbe ID (zwei parallele Laeufe kollidierten) und lief bei einer
+	// Service-ID unter acht Zeichen in einen Panic.
+	instanceID := fmt.Sprintf("%s-inst-%s", s.config.IDPrefix, runID())
 	state.InstanceID = instanceID
 
-	resp, err := s.client.ProvisionInstance(instanceID, state.ServiceID, state.PlanID, false, nil)
+	resp, err := s.client.ProvisionInstance(instanceID, state.ServiceID, state.PlanID, s.client.AcceptsAsync(), nil)
 	if err != nil {
-		results.Failed++
-		results.Failures = append(results.Failures, TestFailure{
-			TestName: testName,
-			Category: "provision",
-			Error:    err.Error(),
-			Endpoint: "/v2/service_instances/{instance_id}",
-			Method:   "PUT",
-		})
+		s.recordFailure(results, testName, "provision", err.Error(),
+			"/v2/service_instances/{instance_id}", "PUT")
 		return
 	}
 
-	if resp.StatusCode != 201 {
-		results.Failed++
-		results.Failures = append(results.Failures, TestFailure{
-			TestName: testName,
-			Category: "provision",
-			Error:    fmt.Sprintf("Expected status 201, got %d", resp.StatusCode),
-			Endpoint: "/v2/service_instances/{instance_id}",
-			Method:   "PUT",
-		})
+	// Ein Broker darf synchron (201) oder asynchron (202) antworten. Nur 201
+	// zu akzeptieren hiess: jeder Broker, der fuer echte Dienste die
+	// vorgesehene asynchrone Antwort gibt, faellt durch.
+	switch resp.StatusCode {
+	case http.StatusCreated:
+		state.CreatedInstances = append(state.CreatedInstances, instanceID)
+	case http.StatusAccepted:
+		state.CreatedInstances = append(state.CreatedInstances, instanceID)
+		st, err := s.client.WaitForOperation(instanceID, "", resp.Operation)
+		if err != nil {
+			s.recordFailure(results, testName+" (async)", "provision", err.Error(),
+				"/v2/service_instances/{instance_id}/last_operation", "GET")
+			return
+		}
+		if st != "succeeded" {
+			s.recordFailure(results, testName+" (async)", "provision",
+				fmt.Sprintf("last_operation ended in %q", st),
+				"/v2/service_instances/{instance_id}/last_operation", "GET")
+			return
+		}
+	default:
+		s.recordFailure(results, testName, "provision",
+			fmt.Sprintf("Expected status 201 or 202, got %d", resp.StatusCode),
+			"/v2/service_instances/{instance_id}", "PUT")
 		return
 	}
 
-	results.Passed++
-	results.Successes = append(results.Successes, TestResult{
-		TestName: testName,
-		Category: "provision",
-	})
+	s.recordSuccess(results, testName, "provision")
 }
 
 func (s *TestSuite) testProvisionIdempotent(results *TestResults, state *TestState) {
 	testName := "Provision is idempotent (second call succeeds)"
-	
+
 	if state.InstanceID == "" {
 		results.Skipped++
 		return
@@ -330,11 +444,11 @@ func (s *TestSuite) testProvisionIdempotent(results *TestResults, state *TestSta
 
 func (s *TestSuite) testProvisionMissingServiceID(results *TestResults, state *TestState) {
 	testName := "Provision without service_id returns 400"
-	
-	instanceID := "test-instance-no-service"
+
+	instanceID := fmt.Sprintf("%s-no-svc-%s", s.config.IDPrefix, runID())
 
 	resp, err := s.client.ProvisionInstance(instanceID, "", state.PlanID, false, nil)
-	
+
 	// Check status code, not error (doRequestWithStatus doesn't error on 400)
 	if err != nil {
 		// HTTP error = test passes
@@ -345,9 +459,9 @@ func (s *TestSuite) testProvisionMissingServiceID(results *TestResults, state *T
 		})
 		return
 	}
-	
+
 	// Check if status code indicates error (400-499)
-	if resp.StatusCode >= 400 {
+	if isClientError(resp.StatusCode) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -355,7 +469,7 @@ func (s *TestSuite) testProvisionMissingServiceID(results *TestResults, state *T
 		})
 		return
 	}
-	
+
 	// No error and status < 400 = test fails
 	results.Failed++
 	results.Failures = append(results.Failures, TestFailure{
@@ -369,11 +483,11 @@ func (s *TestSuite) testProvisionMissingServiceID(results *TestResults, state *T
 
 func (s *TestSuite) testProvisionMissingPlanID(results *TestResults, state *TestState) {
 	testName := "Provision without plan_id returns 400"
-	
-	instanceID := "test-instance-no-plan"
+
+	instanceID := fmt.Sprintf("%s-no-plan-%s", s.config.IDPrefix, runID())
 
 	resp, err := s.client.ProvisionInstance(instanceID, state.ServiceID, "", false, nil)
-	
+
 	// Check status code, not error
 	if err != nil {
 		results.Passed++
@@ -383,8 +497,8 @@ func (s *TestSuite) testProvisionMissingPlanID(results *TestResults, state *Test
 		})
 		return
 	}
-	
-	if resp.StatusCode >= 400 {
+
+	if isClientError(resp.StatusCode) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -392,7 +506,7 @@ func (s *TestSuite) testProvisionMissingPlanID(results *TestResults, state *Test
 		})
 		return
 	}
-	
+
 	results.Failed++
 	results.Failures = append(results.Failures, TestFailure{
 		TestName: testName,
@@ -405,11 +519,11 @@ func (s *TestSuite) testProvisionMissingPlanID(results *TestResults, state *Test
 
 func (s *TestSuite) testProvisionInvalidService(results *TestResults, state *TestState) {
 	testName := "Provision with invalid service returns 400/404"
-	
-	instanceID := "test-instance-invalid"
+
+	instanceID := fmt.Sprintf("%s-invalid-%s", s.config.IDPrefix, runID())
 
 	resp, err := s.client.ProvisionInstance(instanceID, "invalid-service", state.PlanID, false, nil)
-	
+
 	// Check status code, not error
 	if err != nil {
 		results.Passed++
@@ -419,8 +533,8 @@ func (s *TestSuite) testProvisionInvalidService(results *TestResults, state *Tes
 		})
 		return
 	}
-	
-	if resp.StatusCode >= 400 {
+
+	if isClientError(resp.StatusCode) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -428,7 +542,7 @@ func (s *TestSuite) testProvisionInvalidService(results *TestResults, state *Tes
 		})
 		return
 	}
-	
+
 	results.Failed++
 	results.Failures = append(results.Failures, TestFailure{
 		TestName: testName,
@@ -442,14 +556,14 @@ func (s *TestSuite) testProvisionInvalidService(results *TestResults, state *Tes
 // Test helpers - Bind tests
 
 func (s *TestSuite) testBindSuccess(results *TestResults, state *TestState) {
-	testName := "Bind returns 201 Created with credentials"
-	
+	testName := "Bind accepted (201 or 202) with credentials"
+
 	if state.InstanceID == "" {
 		results.Skipped++
 		return
 	}
 
-	bindingID := "test-binding-" + state.ServiceID[:8]
+	bindingID := fmt.Sprintf("%s-bind-%s", s.config.IDPrefix, runID())
 	state.BindingID = bindingID
 
 	resp, err := s.client.BindInstance(state.InstanceID, bindingID, state.ServiceID, state.PlanID, "test-app")
@@ -465,19 +579,36 @@ func (s *TestSuite) testBindSuccess(results *TestResults, state *TestState) {
 		return
 	}
 
-	if resp.StatusCode != 201 {
-		results.Failed++
-		results.Failures = append(results.Failures, TestFailure{
-			TestName: testName,
-			Category: "bind",
-			Error:    fmt.Sprintf("Expected status 201, got %d", resp.StatusCode),
-			Endpoint: "/v2/service_instances/{instance_id}/service_bindings/{binding_id}",
-			Method:   "PUT",
-		})
+	// Wie beim Provision: 201 synchron, 202 asynchron. Bei 202 gibt es noch
+	// keine Credentials - die stehen erst nach dem Abschluss bereit und
+	// werden ueber GET binding geholt.
+	switch resp.StatusCode {
+	case http.StatusCreated:
+		state.CreatedBindings = append(state.CreatedBindings, bindingRef{state.InstanceID, bindingID})
+	case http.StatusAccepted:
+		state.CreatedBindings = append(state.CreatedBindings, bindingRef{state.InstanceID, bindingID})
+		st, err := s.client.WaitForOperation(state.InstanceID, bindingID, resp.Operation)
+		if err != nil {
+			s.recordFailure(results, testName+" (async)", "bind", err.Error(),
+				"/v2/service_instances/{instance_id}/service_bindings/{binding_id}/last_operation", "GET")
+			return
+		}
+		if st != "succeeded" {
+			s.recordFailure(results, testName+" (async)", "bind",
+				fmt.Sprintf("last_operation ended in %q", st),
+				"/v2/service_instances/{instance_id}/service_bindings/{binding_id}/last_operation", "GET")
+			return
+		}
+		s.recordSuccess(results, testName+" (async)", "bind")
+		return
+	default:
+		s.recordFailure(results, testName, "bind",
+			fmt.Sprintf("Expected status 201 or 202, got %d", resp.StatusCode),
+			"/v2/service_instances/{instance_id}/service_bindings/{binding_id}", "PUT")
 		return
 	}
 
-	if resp.Credentials == nil || len(resp.Credentials) == 0 {
+	if len(resp.Credentials) == 0 {
 		results.Failed++
 		results.Failures = append(results.Failures, TestFailure{
 			TestName: testName,
@@ -498,7 +629,7 @@ func (s *TestSuite) testBindSuccess(results *TestResults, state *TestState) {
 
 func (s *TestSuite) testBindIdempotent(results *TestResults, state *TestState) {
 	testName := "Bind is idempotent (second call returns same credentials)"
-	
+
 	if state.BindingID == "" {
 		results.Skipped++
 		return
@@ -551,17 +682,17 @@ func (s *TestSuite) testBindIdempotent(results *TestResults, state *TestState) {
 
 func (s *TestSuite) testBindMissingServiceID(results *TestResults, state *TestState) {
 	testName := "Bind without service_id returns 400"
-	
+
 	if state.InstanceID == "" {
 		results.Skipped++
 		return
 	}
 
-	bindingID := "test-binding-no-service"
+	bindingID := fmt.Sprintf("%s-bind-no-svc-%s", s.config.IDPrefix, runID())
 
 	resp, err := s.client.BindInstance(state.InstanceID, bindingID, "", state.PlanID, "test-app")
-	
-	if err != nil || (resp != nil && resp.StatusCode >= 400) {
+
+	if err != nil || (resp != nil && isClientError(resp.StatusCode)) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -569,7 +700,7 @@ func (s *TestSuite) testBindMissingServiceID(results *TestResults, state *TestSt
 		})
 		return
 	}
-	
+
 	results.Failed++
 	results.Failures = append(results.Failures, TestFailure{
 		TestName: testName,
@@ -582,17 +713,17 @@ func (s *TestSuite) testBindMissingServiceID(results *TestResults, state *TestSt
 
 func (s *TestSuite) testBindMissingPlanID(results *TestResults, state *TestState) {
 	testName := "Bind without plan_id returns 400"
-	
+
 	if state.InstanceID == "" {
 		results.Skipped++
 		return
 	}
 
-	bindingID := "test-binding-no-plan"
+	bindingID := fmt.Sprintf("%s-bind-no-plan-%s", s.config.IDPrefix, runID())
 
 	resp, err := s.client.BindInstance(state.InstanceID, bindingID, state.ServiceID, "", "test-app")
-	
-	if err != nil || (resp != nil && resp.StatusCode >= 400) {
+
+	if err != nil || (resp != nil && isClientError(resp.StatusCode)) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -600,7 +731,7 @@ func (s *TestSuite) testBindMissingPlanID(results *TestResults, state *TestState
 		})
 		return
 	}
-	
+
 	results.Failed++
 	results.Failures = append(results.Failures, TestFailure{
 		TestName: testName,
@@ -613,12 +744,12 @@ func (s *TestSuite) testBindMissingPlanID(results *TestResults, state *TestState
 
 func (s *TestSuite) testBindNonExistentInstance(results *TestResults, state *TestState) {
 	testName := "Bind to non-existent instance returns 404"
-	
-	bindingID := "test-binding-nonexistent"
+
+	bindingID := fmt.Sprintf("%s-bind-ghost-%s", s.config.IDPrefix, runID())
 
 	resp, err := s.client.BindInstance("nonexistent-instance", bindingID, state.ServiceID, state.PlanID, "test-app")
-	
-	if err != nil || (resp != nil && resp.StatusCode >= 400) {
+
+	if err != nil || (resp != nil && isClientError(resp.StatusCode)) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -626,7 +757,7 @@ func (s *TestSuite) testBindNonExistentInstance(results *TestResults, state *Tes
 		})
 		return
 	}
-	
+
 	results.Failed++
 	results.Failures = append(results.Failures, TestFailure{
 		TestName: testName,
@@ -641,7 +772,7 @@ func (s *TestSuite) testBindNonExistentInstance(results *TestResults, state *Tes
 
 func (s *TestSuite) testUpdateInstance(results *TestResults, state *TestState) {
 	testName := "Update instance returns 200 OK"
-	
+
 	if state.InstanceID == "" {
 		results.Skipped++
 		return
@@ -681,10 +812,10 @@ func (s *TestSuite) testUpdateInstance(results *TestResults, state *TestState) {
 
 func (s *TestSuite) testUpdateNonExistentInstance(results *TestResults, state *TestState) {
 	testName := "Update non-existent instance returns 404"
-	
+
 	resp, err := s.client.UpdateInstance("nonexistent-instance", state.ServiceID, state.PlanID, nil)
-	
-	if err != nil || (resp != nil && resp.StatusCode >= 400) {
+
+	if err != nil || (resp != nil && isClientError(resp.StatusCode)) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -692,7 +823,7 @@ func (s *TestSuite) testUpdateNonExistentInstance(results *TestResults, state *T
 		})
 		return
 	}
-	
+
 	results.Failed++
 	results.Failures = append(results.Failures, TestFailure{
 		TestName: testName,
@@ -707,7 +838,7 @@ func (s *TestSuite) testUpdateNonExistentInstance(results *TestResults, state *T
 
 func (s *TestSuite) testGetInstance(results *TestResults, state *TestState) {
 	testName := "Get instance returns 200 OK with service_id and plan_id"
-	
+
 	if state.InstanceID == "" {
 		results.Skipped++
 		return
@@ -759,7 +890,7 @@ func (s *TestSuite) testGetInstance(results *TestResults, state *TestState) {
 
 func (s *TestSuite) testGetBinding(results *TestResults, state *TestState) {
 	testName := "Get binding returns 200 OK with credentials"
-	
+
 	if state.BindingID == "" {
 		results.Skipped++
 		return
@@ -811,10 +942,10 @@ func (s *TestSuite) testGetBinding(results *TestResults, state *TestState) {
 
 func (s *TestSuite) testGetNonExistentInstance(results *TestResults, state *TestState) {
 	testName := "Get non-existent instance returns 404"
-	
+
 	resp, err := s.client.GetInstance("nonexistent-instance")
-	
-	if err != nil || (resp != nil && resp.StatusCode >= 400) {
+
+	if err != nil || (resp != nil && isClientError(resp.StatusCode)) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -822,7 +953,7 @@ func (s *TestSuite) testGetNonExistentInstance(results *TestResults, state *Test
 		})
 		return
 	}
-	
+
 	results.Failed++
 	results.Failures = append(results.Failures, TestFailure{
 		TestName: testName,
@@ -835,15 +966,15 @@ func (s *TestSuite) testGetNonExistentInstance(results *TestResults, state *Test
 
 func (s *TestSuite) testGetNonExistentBinding(results *TestResults, state *TestState) {
 	testName := "Get non-existent binding returns 404"
-	
+
 	if state.InstanceID == "" {
 		results.Skipped++
 		return
 	}
 
 	resp, err := s.client.GetBinding(state.InstanceID, "nonexistent-binding")
-	
-	if err != nil || (resp != nil && resp.StatusCode >= 400) {
+
+	if err != nil || (resp != nil && isClientError(resp.StatusCode)) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -851,7 +982,7 @@ func (s *TestSuite) testGetNonExistentBinding(results *TestResults, state *TestS
 		})
 		return
 	}
-	
+
 	results.Failed++
 	results.Failures = append(results.Failures, TestFailure{
 		TestName: testName,
@@ -864,7 +995,7 @@ func (s *TestSuite) testGetNonExistentBinding(results *TestResults, state *TestS
 
 func (s *TestSuite) testLastOperation(results *TestResults, state *TestState) {
 	testName := "Get last operation returns 200 OK with state"
-	
+
 	if state.InstanceID == "" {
 		results.Skipped++
 		return

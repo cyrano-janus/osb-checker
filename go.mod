@@ -1,4 +1,4 @@
-module github.com/example/osb-checker
+module github.com/cyrano-janus/osb-checker
 
 go 1.21
 

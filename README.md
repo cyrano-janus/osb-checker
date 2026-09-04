@@ -63,12 +63,16 @@ Building an **Open Service Broker (OSB)** is complex. The specification defines 
 
 | Category | Tests | Spec Reference | Section |
 |----------|-------|----------------|---------|
-| Catalog | 4 | [GET /v2/catalog](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#get-v2catalog) | 3.1 |
+| Catalog | 5 | [GET /v2/catalog](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#get-v2catalog) | 3.1 |
 | Provision | 5 | [PUT /v2/service_instances/:id](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#put-v2service_instancesid) | 3.2 |
 | Bind | 5 | [PUT /v2/service_instances/:id/service_bindings/:id](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#put-v2service_instancesidservice_bindingsid) | 3.3 |
 | Update | 2 | [PATCH /v2/service_instances/:id](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#patch-v2service_instancesid) | 3.4 |
 | Fetch | 5 | [GET endpoints](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#get-v2service_instancesid) | 3.5-3.7 |
-| **Total** | **21** | **Full Spec 2.17 Coverage** | ✅ |
+| Cleanup | 1+ | [DELETE endpoints](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#deprovisioning) | 3.8 |
+| **Total** | **23+** | grows with the number of resources created | ✅ |
+
+Cleanup is reported, not silent: a broker that cannot deprovision what the run
+created shows up as a failure instead of a green report with leftovers.
 
 ### 📜 OSB API 2.17 Specification
 
@@ -81,7 +85,7 @@ This checker implements the complete test suite for **OSB API version 2.17**, th
 - ✅ **Binding** - Credential generation and idempotency (Section 3.3)
 - ✅ **Updates** - Plan changes and parameter updates (Section 3.4)
 - ✅ **Fetching** - Instance and binding retrieval (Section 3.5-3.6)
-- ✅ **Async Operations** - Last operation polling (Section 3.7)
+- ✅ **Async Operations** - `accepts_incomplete` as a query parameter, `202 Accepted`, and `last_operation` polled until the operation settles (Section 3.7)
 - ✅ **Error Handling** - Proper HTTP status codes (Section 4)
 - ✅ **Idempotency** - Repeated operations return same results (Section 5)
 
@@ -91,10 +95,11 @@ This checker implements the complete test suite for **OSB API version 2.17**, th
 
 ### 🚀 Developer-Friendly
 
-- **Zero Configuration** - Works out of the box
+- **Sensible defaults** - every configuration key may be omitted
 - **Detailed Reports** - Clear pass/fail with error messages
-- **Verbose Mode** - Debug every HTTP request
+- **Verbose Mode** - traces the cleanup of created resources
 - **Exit Codes** - Perfect for CI/CD integration
+- **TLS, mTLS and a CA of your own** - including a broker behind `kubectl port-forward`
 
 ---
 
@@ -224,7 +229,11 @@ go build -o osb-checker main.go
 |------|-------------|---------|
 | `-f` | Path to configuration file | `configs/config.yaml` |
 | `-v` | Enable verbose output | `false` |
+| `--version` | Print the version and exit | - |
 | `-h` | Show help message | - |
+
+> `configs/` is gitignored — it holds real broker credentials. Copy the
+> template first: `cp config.yaml configs/config.yaml`.
 
 ### Examples
 
@@ -258,7 +267,7 @@ api_version: "2.17"
 
 ## 📊 Test Coverage
 
-### Catalog Tests (4 tests)
+### Catalog Tests (5 tests)
 
 | Test | Description | Status | Spec Section |
 |------|-------------|--------|--------------|
@@ -266,6 +275,7 @@ api_version: "2.17"
 | ✅ Catalog has services | At least one service | Pass | 3.1 |
 | ✅ Service structure | Required fields present | Pass | 3.1 |
 | ✅ Plan structure | Required fields present | Pass | 3.1 |
+| ✅ Service selection | The audited service is named in the report | Pass | 3.1 |
 
 ### Provision Tests (5 tests)
 
@@ -310,23 +320,43 @@ api_version: "2.17"
 
 ### Configuration File
 
+Every key may be omitted; the value shown is the default. The annotated
+template lives in `config.yaml` at the repository root.
+
 ```yaml
 # configs/config.yaml
 
-# Broker URL (required)
-broker_url: "http://localhost:8080"
-
-# Optional: Basic Auth
-username: "user"
-password: "pass"
-
-# API Version (default: 2.17)
+broker_url: "http://localhost:8080"   # required, no trailing slash
+username: ""
+password: ""
 api_version: "2.17"
 
-# Async support
+# Sends accepts_incomplete=true as a QUERY parameter. The broker may then
+# answer 202, and the checker polls last_operation until the operation
+# settles. With false the broker has to answer synchronously.
 accepts_async: true
+poll_timeout_seconds: 300
 
-# Enable/disable test categories
+# WHICH service is audited. Without a choice the checker takes the first
+# service that is not listed in skip_services and has at least one plan.
+# Setting it is the normal case: catalogue order is not a promise.
+service_id: ""
+plan_id: ""
+skip_services: []          # e.g. demo services a broker ships for illustration
+
+id_prefix: "osb-checker"   # goes into every instance and binding id
+timeout_seconds: 30        # per HTTP request
+
+# Maps a hostname onto an address, like curl's --resolve. For a broker behind
+# `kubectl port-forward`: the certificate names the in-cluster service, but it
+# is reachable on localhost. This keeps verification on instead of disabling it.
+resolve: ""                # "host:port:address"
+
+ca_cert: ""                # verify the broker certificate against your own CA
+client_cert: ""            # mTLS
+client_key: ""
+insecure: false            # never in CI
+
 test_catalog: true
 test_provision: true
 test_bind: true
@@ -334,16 +364,53 @@ test_update: true
 test_fetch: true
 ```
 
+### Choosing the service under test
+
+The checker audits **one** service. Which one decides what the report is worth,
+so it is stated in the first line of the output.
+
+```yaml
+service_id: "f48a9e21-cnpg-0000-0000-000000000001"
+plan_id: "plan-small-0000-0000-000000000001"   # optional, else the first plan
+```
+
+A `service_id` that is not in the catalogue is a failure, not a silent
+fallback — otherwise a CI run happily audits something other than intended.
+
 ### Environment Variables
 
-You can also use environment variables:
+Environment variables override the file. In CI, credentials belong there
+rather than in a checked-in file.
+
+| Variable | Overrides |
+|---|---|
+| `OSB_BROKER_URL` | `broker_url` |
+| `OSB_USERNAME` | `username` |
+| `OSB_PASSWORD` | `password` |
+| `OSB_SERVICE_ID` | `service_id` |
+| `OSB_PLAN_ID` | `plan_id` |
+| `OSB_ID_PREFIX` | `id_prefix` |
 
 ```bash
 export OSB_BROKER_URL="http://localhost:8080"
 export OSB_USERNAME="user"
 export OSB_PASSWORD="pass"
-./osb-checker
+./osb-checker -f configs/config.yaml
 ```
+
+### TLS, mTLS and a broker behind a port-forward
+
+```yaml
+broker_url: "https://osb-broker.osb-broker.svc.cluster.local:18443"
+resolve:    "osb-broker.osb-broker.svc.cluster.local:18443:127.0.0.1"
+ca_cert:    "/tmp/broker-ca.crt"
+client_cert: "/tmp/client.crt"    # only when the broker requires mTLS
+client_key:  "/tmp/client.key"
+```
+
+`insecure: true` exists to narrow a fault down and nothing else. Note that the
+negative tests read a transport error as "the broker rejected it" — with
+verification off, a TLS failure would show up as a partly green report.
 
 ---
 
