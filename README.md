@@ -64,12 +64,12 @@ Building an **Open Service Broker (OSB)** is complex. The specification defines 
 | Category | Tests | Spec Reference | Section |
 |----------|-------|----------------|---------|
 | Catalog | 5 | [GET /v2/catalog](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#get-v2catalog) | 3.1 |
-| Provision | 5 | [PUT /v2/service_instances/:id](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#put-v2service_instancesid) | 3.2 |
+| Provision | 6 | [PUT /v2/service_instances/:id](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#put-v2service_instancesid) | 3.2 |
 | Bind | 5 | [PUT /v2/service_instances/:id/service_bindings/:id](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#put-v2service_instancesidservice_bindingsid) | 3.3 |
 | Update | 2 | [PATCH /v2/service_instances/:id](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#patch-v2service_instancesid) | 3.4 |
 | Fetch | 5 | [GET endpoints](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#get-v2service_instancesid) | 3.5-3.7 |
 | Cleanup | 1+ | [DELETE endpoints](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#deprovisioning) | 3.8 |
-| **Total** | **23+** | grows with the number of resources created | ✅ |
+| **Total** | **24+** | grows with the number of resources created | ✅ |
 
 Cleanup is reported, not silent: a broker that cannot deprovision what the run
 created shows up as a failure instead of a green report with leftovers.
@@ -277,7 +277,7 @@ api_version: "2.17"
 | ✅ Plan structure | Required fields present | Pass | 3.1 |
 | ✅ Service selection | The audited service is named in the report | Pass | 3.1 |
 
-### Provision Tests (5 tests)
+### Provision Tests (6 tests)
 
 | Test | Description | Status | Spec Section |
 |------|-------------|--------|--------------|
@@ -315,6 +315,41 @@ api_version: "2.17"
 | ✅ Last operation | Returns 200 with state | Pass | 3.7 |
 
 ---
+
+## 🔬 How do we know the checker checks?
+
+A green run proves nothing on its own. A tool whose checks *cannot* fail is
+indistinguishable from one that passes everything — and that was the state
+here: the audited service was always the first catalogue entry, a transport
+error counted as a pass, and against a TLS broker the checker never connected
+at all.
+
+`test/mockbroker_test.go` turns the question around. It stands up a conformant
+broker with `httptest` and demands **zero** failures; then it breaks exactly one
+rule and demands that precisely the corresponding check fires.
+
+| Mutation | Expectation |
+|---|---|
+| conformant broker | 0 failures — a tool that complains about a correct broker is as useless as one that never complains |
+| provision answers 200 instead of 201 | the provision check fails |
+| a repeat provision answers 201 instead of 200 | the idempotency check fails |
+| a missing `service_id` yields 500 instead of 4xx | the negative check fails |
+| deprovisioning an unknown instance answers 200 instead of 410 | that check fails |
+| bind returns no credentials | the bind check fails |
+| `last_operation` omits `state` | that check fails |
+| **the server is closed** | **every** check fails and none passes |
+
+The last row is the important one. It is the property that was violated, and it
+is what made a broken connection look like a conformant broker.
+
+Writing these mutations immediately found two checks that could not fail at
+all: the idempotency check accepted both 200 and 201, and there was no check
+for `410 Gone` on deprovisioning an unknown instance. Both are fixed; the
+mutations that found them stay as a regression net.
+
+```bash
+go test ./test/ -run TestMock -v
+```
 
 ## ⚙️ Configuration
 

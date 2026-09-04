@@ -85,11 +85,10 @@ func (s *TestSuite) runCatalogTests(results *TestResults, state *TestState) {
 
 func (s *TestSuite) runProvisionTests(results *TestResults, state *TestState) {
 	if state.ServiceID == "" || state.PlanID == "" {
+		// Uebersprungen ist nicht bestanden. Frueher stand der Eintrag in der
+		// Erfolgsliste - ein Lauf, der nichts geprueft hat, las sich damit wie
+		// einer, der alles bestanden hat.
 		results.Skipped++
-		results.Successes = append(results.Successes, TestResult{
-			TestName: "Provision tests skipped (no service/plan found)",
-			Category: "provision",
-		})
 		return
 	}
 
@@ -98,6 +97,32 @@ func (s *TestSuite) runProvisionTests(results *TestResults, state *TestState) {
 	s.testProvisionMissingServiceID(results, state)
 	s.testProvisionMissingPlanID(results, state)
 	s.testProvisionInvalidService(results, state)
+	s.testDeprovisionNonExistent(results, state)
+}
+
+// testDeprovisionNonExistent prueft 410 Gone.
+//
+// Diese Pruefung fehlte ganz: DELETE kam nur im Aufraeumen vor, und dessen
+// Ergebnis wurde nicht bewertet. Ein Broker, der das Loeschen einer
+// unbekannten Instanz mit 200 quittiert, kam damit durch - dabei ist der
+// Unterschied fuer die Plattform wesentlich, sie leitet daraus ab, ob sie den
+// Datensatz vergessen darf.
+func (s *TestSuite) testDeprovisionNonExistent(results *TestResults, state *TestState) {
+	testName := "Deprovision of an unknown instance returns 410 Gone"
+
+	id := fmt.Sprintf("%s-ghost-%s", s.config.IDPrefix, runID())
+	resp, err := s.client.DeprovisionInstance(id, state.ServiceID, state.PlanID)
+	if err != nil {
+		s.failTransport(results, testName, "provision", err)
+		return
+	}
+	if resp.StatusCode != http.StatusGone {
+		s.recordFailure(results, testName, "provision",
+			fmt.Sprintf("Expected status 410, got %d", resp.StatusCode),
+			"/v2/service_instances/{instance_id}", "DELETE")
+		return
+	}
+	s.recordSuccess(results, testName, "provision")
 }
 
 func (s *TestSuite) runBindTests(results *TestResults, state *TestState) {
@@ -172,6 +197,49 @@ func (s *TestSuite) recordFailure(results *TestResults, name, category, msg, end
 	results.Failures = append(results.Failures, TestFailure{
 		TestName: name, Category: category, Error: msg, Endpoint: endpoint, Method: method,
 	})
+}
+
+// selectedService liefert den Service, den pickService gewaehlt hat.
+//
+// Diese Pruefungen sahen frueher auf Services[0]. Damit validierten sie einen
+// anderen Service als den, den der Lebenszyklus danach anfasst - bei einem
+// Broker mit Demo-Angeboten also nie den, um den es geht.
+func selectedService(state *TestState) (models.Service, bool) {
+	if state.Catalog == nil || state.ServiceID == "" {
+		return models.Service{}, false
+	}
+	for _, svc := range state.Catalog.Services {
+		if svc.ID == state.ServiceID {
+			return svc, true
+		}
+	}
+	return models.Service{}, false
+}
+
+// selectedPlan liefert den gewaehlten Plan des gewaehlten Service.
+func selectedPlan(state *TestState) (models.ServicePlan, bool) {
+	svc, ok := selectedService(state)
+	if !ok {
+		return models.ServicePlan{}, false
+	}
+	for _, p := range svc.Plans {
+		if p.ID == state.PlanID {
+			return p, true
+		}
+	}
+	return models.ServicePlan{}, false
+}
+
+// failTransport bucht einen Transportfehler als Fehlschlag.
+//
+// Frueher galt "err != nil" in den Negativpruefungen als bestanden - die
+// Ueberlegung war, dass eine abgelehnte Anfrage auch eine Ablehnung ist. Das
+// ist falsch: bei einem Verbindungs- oder TLS-Fehler wurde gar nichts
+// geprueft, und ein unerreichbarer Broker saehe damit aus wie ein konformer.
+// Genau so ging dieser Checker gegen einen TLS-Broker teilweise auf gruen.
+func (s *TestSuite) failTransport(results *TestResults, testName, category string, err error) {
+	s.recordFailure(results, testName, category,
+		"request failed, nothing was verified: "+err.Error(), "", "")
 }
 
 // isClientError prueft auf 4xx.
@@ -300,12 +368,12 @@ func (s *TestSuite) testCatalogHasServices(results *TestResults, state *TestStat
 func (s *TestSuite) testCatalogServiceStructure(results *TestResults, state *TestState) {
 	testName := "Service has required fields (id, name, description, plans)"
 
-	if state.Catalog == nil || len(state.Catalog.Services) == 0 {
+	service, ok := selectedService(state)
+	if !ok {
 		results.Skipped++
 		return
 	}
 
-	service := state.Catalog.Services[0]
 	if service.ID == "" || service.Name == "" || service.Description == "" || len(service.Plans) == 0 {
 		results.Failed++
 		results.Failures = append(results.Failures, TestFailure{
@@ -328,12 +396,12 @@ func (s *TestSuite) testCatalogServiceStructure(results *TestResults, state *Tes
 func (s *TestSuite) testCatalogPlanStructure(results *TestResults, state *TestState) {
 	testName := "Plan has required fields (id, name, description)"
 
-	if state.Catalog == nil || len(state.Catalog.Services) == 0 {
+	plan, ok := selectedPlan(state)
+	if !ok {
 		results.Skipped++
 		return
 	}
 
-	plan := state.Catalog.Services[0].Plans[0]
 	if plan.ID == "" || plan.Name == "" || plan.Description == "" {
 		results.Failed++
 		results.Failures = append(results.Failures, TestFailure{
@@ -403,7 +471,7 @@ func (s *TestSuite) testProvisionSuccess(results *TestResults, state *TestState)
 }
 
 func (s *TestSuite) testProvisionIdempotent(results *TestResults, state *TestState) {
-	testName := "Provision is idempotent (second call succeeds)"
+	testName := "Provision is idempotent (repeat returns 200)"
 
 	if state.InstanceID == "" {
 		results.Skipped++
@@ -423,12 +491,17 @@ func (s *TestSuite) testProvisionIdempotent(results *TestResults, state *TestSta
 		return
 	}
 
-	if resp.StatusCode != 200 && resp.StatusCode != 201 {
+	// 200, nicht 201. Die Spezifikation ist hier eindeutig: existiert die
+	// Instanz bereits mit denselben Parametern, ist die Antwort 200 OK - 201
+	// hiesse "neu angelegt", und die Plattform, die einen Request wiederholt,
+	// wuerde das so lesen. "200 oder 201" zu akzeptieren machte die Pruefung
+	// wirkungslos: sie konnte gar nicht fehlschlagen.
+	if resp.StatusCode != 200 {
 		results.Failed++
 		results.Failures = append(results.Failures, TestFailure{
 			TestName: testName,
 			Category: "provision",
-			Error:    fmt.Sprintf("Expected status 200 or 201, got %d", resp.StatusCode),
+			Error:    fmt.Sprintf("Expected status 200, got %d", resp.StatusCode),
 			Endpoint: "/v2/service_instances/{instance_id}",
 			Method:   "PUT",
 		})
@@ -451,12 +524,7 @@ func (s *TestSuite) testProvisionMissingServiceID(results *TestResults, state *T
 
 	// Check status code, not error (doRequestWithStatus doesn't error on 400)
 	if err != nil {
-		// HTTP error = test passes
-		results.Passed++
-		results.Successes = append(results.Successes, TestResult{
-			TestName: testName,
-			Category: "provision",
-		})
+		s.failTransport(results, testName, "provision", err)
 		return
 	}
 
@@ -490,11 +558,7 @@ func (s *TestSuite) testProvisionMissingPlanID(results *TestResults, state *Test
 
 	// Check status code, not error
 	if err != nil {
-		results.Passed++
-		results.Successes = append(results.Successes, TestResult{
-			TestName: testName,
-			Category: "provision",
-		})
+		s.failTransport(results, testName, "provision", err)
 		return
 	}
 
@@ -526,11 +590,7 @@ func (s *TestSuite) testProvisionInvalidService(results *TestResults, state *Tes
 
 	// Check status code, not error
 	if err != nil {
-		results.Passed++
-		results.Successes = append(results.Successes, TestResult{
-			TestName: testName,
-			Category: "provision",
-		})
+		s.failTransport(results, testName, "provision", err)
 		return
 	}
 
@@ -692,7 +752,12 @@ func (s *TestSuite) testBindMissingServiceID(results *TestResults, state *TestSt
 
 	resp, err := s.client.BindInstance(state.InstanceID, bindingID, "", state.PlanID, "test-app")
 
-	if err != nil || (resp != nil && isClientError(resp.StatusCode)) {
+	if err != nil {
+		s.failTransport(results, testName, "bind", err)
+		return
+	}
+
+	if resp != nil && isClientError(resp.StatusCode) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -723,7 +788,12 @@ func (s *TestSuite) testBindMissingPlanID(results *TestResults, state *TestState
 
 	resp, err := s.client.BindInstance(state.InstanceID, bindingID, state.ServiceID, "", "test-app")
 
-	if err != nil || (resp != nil && isClientError(resp.StatusCode)) {
+	if err != nil {
+		s.failTransport(results, testName, "bind", err)
+		return
+	}
+
+	if resp != nil && isClientError(resp.StatusCode) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -749,7 +819,12 @@ func (s *TestSuite) testBindNonExistentInstance(results *TestResults, state *Tes
 
 	resp, err := s.client.BindInstance("nonexistent-instance", bindingID, state.ServiceID, state.PlanID, "test-app")
 
-	if err != nil || (resp != nil && isClientError(resp.StatusCode)) {
+	if err != nil {
+		s.failTransport(results, testName, "bind", err)
+		return
+	}
+
+	if resp != nil && isClientError(resp.StatusCode) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -815,7 +890,12 @@ func (s *TestSuite) testUpdateNonExistentInstance(results *TestResults, state *T
 
 	resp, err := s.client.UpdateInstance("nonexistent-instance", state.ServiceID, state.PlanID, nil)
 
-	if err != nil || (resp != nil && isClientError(resp.StatusCode)) {
+	if err != nil {
+		s.failTransport(results, testName, "update", err)
+		return
+	}
+
+	if resp != nil && isClientError(resp.StatusCode) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -945,7 +1025,12 @@ func (s *TestSuite) testGetNonExistentInstance(results *TestResults, state *Test
 
 	resp, err := s.client.GetInstance("nonexistent-instance")
 
-	if err != nil || (resp != nil && isClientError(resp.StatusCode)) {
+	if err != nil {
+		s.failTransport(results, testName, "fetch", err)
+		return
+	}
+
+	if resp != nil && isClientError(resp.StatusCode) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -974,7 +1059,12 @@ func (s *TestSuite) testGetNonExistentBinding(results *TestResults, state *TestS
 
 	resp, err := s.client.GetBinding(state.InstanceID, "nonexistent-binding")
 
-	if err != nil || (resp != nil && isClientError(resp.StatusCode)) {
+	if err != nil {
+		s.failTransport(results, testName, "fetch", err)
+		return
+	}
+
+	if resp != nil && isClientError(resp.StatusCode) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
