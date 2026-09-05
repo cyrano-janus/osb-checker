@@ -42,13 +42,16 @@ type mutation struct {
 	getBindingStatus          int  // statt 200
 	lastOperationNoState      bool // 200, aber ohne state
 	serviceWithoutDescription bool
+	updateNeedsPlanID         bool // PATCH ohne plan_id wird abgelehnt
+	updateDropsParams         bool // PATCH nimmt parameters an und verwirft sie
 }
 
 type mockBroker struct {
 	*httptest.Server
 	mu        sync.Mutex
-	instances map[string]map[string]string // id -> {service_id, plan_id}
-	bindings  map[string]string            // bindingID -> instanceID
+	instances map[string]map[string]string      // id -> {service_id, plan_id}
+	params    map[string]map[string]interface{} // id -> zuletzt gesetzte parameters
+	bindings  map[string]string                 // bindingID -> instanceID
 	mut       mutation
 }
 
@@ -61,6 +64,7 @@ const (
 func newMockBroker(m mutation) *mockBroker {
 	b := &mockBroker{
 		instances: map[string]map[string]string{},
+		params:    map[string]map[string]interface{}{},
 		bindings:  map[string]string{},
 		mut:       m,
 	}
@@ -149,6 +153,21 @@ func (b *mockBroker) instance(w http.ResponseWriter, r *http.Request, id string)
 			writeJSON(w, 404, map[string]string{"error": "NotFound"})
 			return
 		}
+		var req map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		plan, _ := req["plan_id"].(string)
+		if plan == "" && b.mut.updateNeedsPlanID {
+			writeJSON(w, 400, map[string]string{"error": "BadRequest", "description": "plan_id is required"})
+			return
+		}
+		if params, ok := req["parameters"].(map[string]interface{}); ok && !b.mut.updateDropsParams {
+			if b.params[id] == nil {
+				b.params[id] = map[string]interface{}{}
+			}
+			for k, v := range params {
+				b.params[id][k] = v
+			}
+		}
 		writeJSON(w, 200, map[string]interface{}{})
 
 	case http.MethodDelete:
@@ -165,7 +184,15 @@ func (b *mockBroker) instance(w http.ResponseWriter, r *http.Request, id string)
 			writeJSON(w, 404, map[string]string{"error": "NotFound"})
 			return
 		}
-		writeJSON(w, 200, map[string]string{"service_id": inst["service_id"], "plan_id": inst["plan_id"]})
+		// Ein Broker, der Parameter meldet, meldet auch das leere Objekt.
+		// Nur so laesst sich "verworfen" von "meldet grundsaetzlich keine"
+		// unterscheiden.
+		params := b.params[id]
+		if params == nil {
+			params = map[string]interface{}{}
+		}
+		writeJSON(w, 200, map[string]interface{}{
+			"service_id": inst["service_id"], "plan_id": inst["plan_id"], "parameters": params})
 
 	default:
 		http.NotFound(w, r)
@@ -340,6 +367,8 @@ func TestMock_JedeMutationWirdBemerkt(t *testing.T) {
 		{"GET binding antwortet 404 statt 200", mutation{getBindingStatus: 404}, "binding"},
 		{"last_operation ohne state", mutation{lastOperationNoState: true}, "operation"},
 		{"Service ohne description", mutation{serviceWithoutDescription: true}, "required fields"},
+		{"PATCH ohne plan_id wird abgelehnt", mutation{updateNeedsPlanID: true}, "parameters"},
+		{"PATCH nimmt parameters an und verwirft sie", mutation{updateDropsParams: true}, "parameters"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := withBroker(t, tc.mut)

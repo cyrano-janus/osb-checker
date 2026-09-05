@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/cyrano-janus/osb-checker/test/config"
 	"github.com/cyrano-janus/osb-checker/test/models"
@@ -136,6 +137,7 @@ func (s *TestSuite) runBindTests(results *TestResults, state *TestState) {
 func (s *TestSuite) runUpdateTests(results *TestResults, state *TestState) {
 	s.testUpdateInstance(results, state)
 	s.testUpdateNonExistentInstance(results, state)
+	s.testUpdateParametersWithoutPlanID(results, state)
 }
 
 func (s *TestSuite) runFetchTests(results *TestResults, state *TestState) {
@@ -883,6 +885,83 @@ func (s *TestSuite) testUpdateInstance(results *TestResults, state *TestState) {
 		TestName: testName,
 		Category: "update",
 	})
+}
+
+// testUpdateParametersWithoutPlanID prueft den Weg von
+// `cf update-service -c '{...}'`: ein PATCH, der nur Parameter traegt.
+//
+// Zwei Zusagen aus OSB 2.17:
+//
+//  1. `plan_id` ist im PATCH optional. Ein Broker, der es verlangt, lehnt eine
+//     Anfrage ab, die die Spezifikation erlaubt.
+//  2. Was der Broker angenommen hat, muss er auch berichten - sofern er
+//     GET /v2/service_instances mit einem `parameters`-Objekt beantwortet.
+//     Tut er das nicht, ist das erlaubt und wird uebersprungen: ohne
+//     Rueckmeldung laesst sich die Zusage nicht pruefen.
+//
+// Diese Pruefung hat einen praktischen Anlass. Cloud Foundry auf Korifi reicht
+// ein `cf update-service -c` nicht an den Broker weiter - die CLI meldet
+// Erfolg, ohne dass je ein PATCH ankommt. Wer nur ueber die Plattform prueft,
+// prueft diesen Pfad also gar nicht.
+func (s *TestSuite) testUpdateParametersWithoutPlanID(results *TestResults, state *TestState) {
+	const testName = "Update with parameters and no plan_id is accepted and reported"
+	const category = "update"
+	const probeKey = "osbCheckerProbe"
+
+	if state.InstanceID == "" {
+		results.Skipped++
+		return
+	}
+	probe := fmt.Sprintf("v%d", time.Now().UnixNano()%100000)
+
+	resp, err := s.client.UpdateInstanceParameters(state.InstanceID, state.ServiceID,
+		map[string]interface{}{probeKey: probe})
+	if err != nil {
+		s.failTransport(results, testName, category, err)
+		return
+	}
+
+	if resp.StatusCode == 400 || resp.StatusCode == 422 {
+		// Ein Broker darf einen Parameter ablehnen, den er nicht kennt. Was
+		// er nicht darf, ist die Anfrage allein wegen des fehlenden plan_id
+		// ablehnen. Die Gegenprobe trennt beides: dieselben Parameter, aber
+		// mit plan_id. Geht die durch, lag es am plan_id.
+		withPlan, perr := s.client.UpdateInstance(state.InstanceID, state.ServiceID, state.PlanID,
+			map[string]interface{}{probeKey: probe})
+		if perr == nil && (withPlan.StatusCode == 200 || withPlan.StatusCode == 202) {
+			s.recordFailure(results, testName, category,
+				fmt.Sprintf("PATCH without plan_id -> %d, with plan_id -> %d: plan_id is optional in an update (OSB 2.17)",
+					resp.StatusCode, withPlan.StatusCode),
+				"/v2/service_instances/{instance_id}", "PATCH")
+			return
+		}
+		results.Skipped++
+		return
+	}
+
+	if resp.StatusCode != 200 && resp.StatusCode != 202 {
+		s.recordFailure(results, testName, category,
+			fmt.Sprintf("Expected status 200 or 202, got %d", resp.StatusCode),
+			"/v2/service_instances/{instance_id}", "PATCH")
+		return
+	}
+
+	inst, err := s.client.GetInstance(state.InstanceID)
+	if err != nil || inst.StatusCode != 200 || inst.Parameters == nil {
+		// Der Broker gibt Parameter nicht zurueck. Erlaubt, aber dann laesst
+		// sich die zweite Zusage nicht pruefen.
+		results.Skipped++
+		return
+	}
+	if inst.Parameters[probeKey] != probe {
+		s.recordFailure(results, testName, category,
+			fmt.Sprintf("parameter %q was accepted but not reported back by GET", probeKey),
+			"/v2/service_instances/{instance_id}", "GET")
+		return
+	}
+
+	results.Passed++
+	results.Successes = append(results.Successes, TestResult{TestName: testName, Category: category})
 }
 
 func (s *TestSuite) testUpdateNonExistentInstance(results *TestResults, state *TestState) {

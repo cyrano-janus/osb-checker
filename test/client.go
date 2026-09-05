@@ -277,6 +277,42 @@ func (c *OSBClient) GetInstance(instanceID string) (*models.GetInstanceResponse,
 	return &instanceResp, nil
 }
 
+// UpdateInstanceParameters schickt ein PATCH, das nur Parameter traegt - ohne
+// plan_id. Genau die Form, die `cf update-service -c '{...}'` erzeugt.
+//
+// UpdateInstance schickt plan_id immer mit; damit laesst sich nicht pruefen,
+// ob ein Broker es faelschlich verlangt. Laut OSB 2.17 ist das Feld im PATCH
+// optional.
+func (c *OSBClient) UpdateInstanceParameters(instanceID, serviceID string, params map[string]interface{}) (*UpdateResponse, error) {
+	url := fmt.Sprintf("%s/v2/service_instances/%s%s", c.BaseURL, instanceID, c.asyncQuery("?"))
+
+	body, err := json.Marshal(map[string]interface{}{
+		"service_id": serviceID,
+		"parameters": params,
+		"context":    map[string]interface{}{"platform": "osb-checker"},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := c.newRequest("PATCH", url, body)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.doRequestWithStatus(req)
+	if err != nil {
+		return nil, err
+	}
+
+	var updateResp UpdateResponse
+	if err := json.Unmarshal(resp.Body, &updateResp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal update response: %w", err)
+	}
+	updateResp.StatusCode = resp.StatusCode
+	return &updateResp, nil
+}
+
 // GetBinding fetches binding details
 func (c *OSBClient) GetBinding(instanceID, bindingID string) (*models.GetBindingResponse, error) {
 	url := fmt.Sprintf("%s/v2/service_instances/%s/service_bindings/%s",
