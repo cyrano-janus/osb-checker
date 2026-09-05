@@ -79,10 +79,72 @@ func (s *TestSuite) Run() *TestResults {
 }
 
 func (s *TestSuite) runCatalogTests(results *TestResults, state *TestState) {
+	s.testVersionNegotiation(results)
+	s.testErrorBody(results, state)
 	s.testCatalogExists(results, state)
 	s.testCatalogHasServices(results, state)
 	s.testCatalogServiceStructure(results, state)
 	s.testCatalogPlanStructure(results, state)
+}
+
+// testVersionNegotiation prueft die Aushandlung aus OSB 2.17: der Header
+// `X-Broker-API-Version` ist Pflicht, und eine Hauptversion, die der Broker
+// nicht bedienen kann, ist `412 Precondition Failed`.
+//
+// Ohne diese Pruefung faellt ein Broker nicht auf, der den Header ignoriert und
+// nach seiner eigenen Version antwortet - auf Anfragen, auf die sich niemand
+// geeinigt hat.
+func (s *TestSuite) testVersionNegotiation(results *TestResults) {
+	const category = "catalog"
+	const endpoint = "/v2/catalog"
+
+	for _, tc := range []struct {
+		name    string
+		version string
+		want    int
+	}{
+		{"Request without X-Broker-API-Version returns 412", "", 412},
+		// Eine andere Hauptversion ist eine andere Schnittstelle. Eine neuere
+		// NEBENversion wird bewusst nicht geprueft: die Plattform nennt, was
+		// sie zu sprechen bereit ist, und ein Broker, der weniger kann, darf
+		// trotzdem antworten.
+		{"Unsupported major API version returns 412", "3.0", 412},
+	} {
+		status, err := s.client.CatalogWithVersion(tc.version)
+		if err != nil {
+			s.failTransport(results, tc.name, category, err)
+			continue
+		}
+		if status != tc.want {
+			s.recordFailure(results, tc.name, category,
+				fmt.Sprintf("Expected status %d, got %d", tc.want, status), endpoint, "GET")
+			continue
+		}
+		s.recordSuccess(results, tc.name, category)
+	}
+}
+
+// testErrorBody prueft, dass eine Fehlerantwort `error` und `description`
+// traegt. OSB verlangt das, damit eine Plattform dem Benutzer sagen kann, was
+// schiefging - ein leerer Koerper zwingt sie, den Statuscode zu raten.
+func (s *TestSuite) testErrorBody(results *TestResults, state *TestState) {
+	const testName = "Error responses carry error and description"
+	const category = "catalog"
+
+	// Eine Anfrage, die sicher scheitert: Provision ohne service_id.
+	instanceID := fmt.Sprintf("%s-errbody-%s", s.config.IDPrefix, runID())
+	resp, err := s.client.ProvisionInstance(instanceID, "", state.PlanID, false, nil)
+	if err != nil {
+		s.failTransport(results, testName, category, err)
+		return
+	}
+	if resp.Error == "" || resp.Description == "" {
+		s.recordFailure(results, testName, category,
+			fmt.Sprintf("error response (status %d) must carry error and description", resp.StatusCode),
+			"/v2/service_instances/{instance_id}", "PUT")
+		return
+	}
+	s.recordSuccess(results, testName, category)
 }
 
 func (s *TestSuite) runProvisionTests(results *TestResults, state *TestState) {
@@ -135,7 +197,57 @@ func (s *TestSuite) runBindTests(results *TestResults, state *TestState) {
 	s.testBindNonExistentInstance(results, state)
 }
 
+// testProvisionConflict prueft, dass eine bestehende Instanz nicht still
+// ueberschrieben wird: dieselbe instance_id mit anderem Plan ist 409.
+//
+// Ohne diese Zusage koennte eine Plattform, die einen Request wiederholt und
+// dabei etwas anderes schickt, die Instanz eines Kunden umbauen, ohne dass es
+// jemand bemerkt.
+func (s *TestSuite) testProvisionConflict(results *TestResults, state *TestState) {
+	const testName = "Re-provision with different attributes returns 409 Conflict"
+	const category = "provision"
+
+	if state.InstanceID == "" {
+		results.Skipped++
+		return
+	}
+	other := otherPlanID(state)
+	if other == "" {
+		// Ein Service mit nur einem Plan kann diesen Konflikt nicht erzeugen.
+		results.Skipped++
+		return
+	}
+
+	resp, err := s.client.ProvisionInstance(state.InstanceID, state.ServiceID, other, false, nil)
+	if err != nil {
+		s.failTransport(results, testName, category, err)
+		return
+	}
+	if resp.StatusCode != 409 {
+		s.recordFailure(results, testName, category,
+			fmt.Sprintf("Expected status 409, got %d", resp.StatusCode),
+			"/v2/service_instances/{instance_id}", "PUT")
+		return
+	}
+	s.recordSuccess(results, testName, category)
+}
+
+// otherPlanID liefert einen Plan desselben Service, der nicht der gepruefte ist.
+func otherPlanID(state *TestState) string {
+	svc, ok := selectedService(state)
+	if !ok {
+		return ""
+	}
+	for _, p := range svc.Plans {
+		if p.ID != state.PlanID {
+			return p.ID
+		}
+	}
+	return ""
+}
+
 func (s *TestSuite) runUpdateTests(results *TestResults, state *TestState) {
+	s.testProvisionConflict(results, state)
 	s.testUpdateInstance(results, state)
 	s.testUpdateNonExistentInstance(results, state)
 	s.testUpdateParametersWithoutPlanID(results, state)

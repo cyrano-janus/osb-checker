@@ -48,6 +48,9 @@ type mutation struct {
 	deprovisionStatus         int  // statt 200 - auch beim Aufraeumen
 	wrongClientErrorStatus    int  // 404 statt 400 bei fehlender service_id
 	updateAsyncStatus         int  // 202 statt 200 - im Async-Modus konform
+	noVersionCheck            bool // fehlender X-Broker-API-Version wird bedient
+	conflictStatus            int  // statt 409 bei abweichenden Attributen
+	errorBodyEmpty            bool // Fehlerantwort ohne error/description
 }
 
 type mockBroker struct {
@@ -66,6 +69,7 @@ const (
 )
 
 func newMockBroker(m mutation) *mockBroker {
+	mockErrBodyEmpty = m.errorBodyEmpty
 	b := &mockBroker{
 		instances: map[string]map[string]string{},
 		params:    map[string]map[string]interface{}{},
@@ -77,6 +81,17 @@ func newMockBroker(m mutation) *mockBroker {
 }
 
 func (b *mockBroker) route(w http.ResponseWriter, r *http.Request) {
+	// Versionsaushandlung (OSB 2.17): der Header ist Pflicht, eine fremde
+	// Hauptversion ist 412.
+	if !b.mut.noVersionCheck {
+		v := r.Header.Get("X-Broker-API-Version")
+		if v == "" || !strings.HasPrefix(v, "2.") {
+			writeJSON(w, 412, map[string]string{
+				"error": "PreconditionFailed", "description": "X-Broker-API-Version header is required"})
+			return
+		}
+	}
+
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	switch {
 	case len(parts) == 2 && parts[1] == "catalog":
@@ -94,7 +109,13 @@ func (b *mockBroker) route(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// mockErrBodyEmpty laesst jede Fehlerantwort ohne error/description ausgehen.
+var mockErrBodyEmpty bool
+
 func writeJSON(w http.ResponseWriter, status int, body interface{}) {
+	if mockErrBodyEmpty && status >= 400 {
+		body = map[string]string{}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
@@ -150,7 +171,8 @@ func (b *mockBroker) instance(w http.ResponseWriter, r *http.Request, id string)
 				writeJSON(w, b.status(b.mut.reprovisionStatus, 200), map[string]string{"dashboard_url": "https://example.test/" + id})
 				return
 			}
-			writeJSON(w, 409, map[string]string{"error": "Conflict"})
+			writeJSON(w, orMock(b.mut.conflictStatus, 409),
+				map[string]string{"error": "Conflict", "description": "instance exists with other attributes"})
 			return
 		}
 		b.instances[id] = map[string]string{"service_id": svc, "plan_id": plan}
@@ -385,6 +407,9 @@ func TestMock_JedeMutationWirdBemerkt(t *testing.T) {
 		{"Service ohne description", mutation{serviceWithoutDescription: true}, "required fields"},
 		{"PATCH ohne plan_id wird abgelehnt", mutation{updateNeedsPlanID: true}, "parameters"},
 		{"PATCH nimmt parameters an und verwirft sie", mutation{updateDropsParams: true}, "parameters"},
+		{"fehlender Versionsheader wird bedient", mutation{noVersionCheck: true}, "version"},
+		{"abweichende Attribute ergeben 200 statt 409", mutation{conflictStatus: 200}, "409 Conflict"},
+		{"Fehlerantwort ohne error/description", mutation{errorBodyEmpty: true}, "error and description"},
 		{"Deprovision antwortet 500 - auch beim Aufraeumen", mutation{deprovisionStatus: 500}, ""},
 		{"Unbind antwortet 500 - auch beim Aufraeumen", mutation{unbindStatus: 500}, ""},
 		{"fehlende service_id ergibt 404 statt 400", mutation{wrongClientErrorStatus: 404}, "service_id"},

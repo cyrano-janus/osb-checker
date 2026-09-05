@@ -425,6 +425,30 @@ func (c *OSBClient) newRequest(method, url string, body []byte) (*http.Request, 
 	return req, nil
 }
 
+// CatalogWithVersion holt den Katalog mit einem abweichenden oder fehlenden
+// Versionsheader - fuer die Pruefung der Aushandlung aus OSB 2.17. Ein leerer
+// Wert heisst: Header weglassen.
+func (c *OSBClient) CatalogWithVersion(version string) (int, error) {
+	req, err := http.NewRequest("GET", c.BaseURL+"/v2/catalog", nil)
+	if err != nil {
+		return 0, err
+	}
+	if version != "" {
+		req.Header.Set("X-Broker-API-Version", version)
+	}
+	if c.Username != "" && c.Password != "" {
+		auth := base64.StdEncoding.EncodeToString([]byte(c.Username + ":" + c.Password))
+		req.Header.Set("Authorization", "Basic "+auth)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, nil
+}
+
 func (c *OSBClient) doRequest(req *http.Request) ([]byte, error) {
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -467,7 +491,12 @@ func (c *OSBClient) doRequestWithStatus(req *http.Request) (*ResponseWithStatus,
 type ProvisionResponse struct {
 	DashboardURL string `json:"dashboard_url,omitempty"`
 	Operation    string `json:"operation,omitempty"`
-	StatusCode   int
+	// Error und Description tragen den OSB-Fehlerkoerper. Sie gehoeren in die
+	// Antwortstruktur, weil eine Pruefung sonst nicht sagen kann, ob der
+	// Broker die Ursache ueberhaupt genannt hat.
+	Error       string `json:"error,omitempty"`
+	Description string `json:"description,omitempty"`
+	StatusCode  int
 }
 
 type DeprovisionResponse struct {

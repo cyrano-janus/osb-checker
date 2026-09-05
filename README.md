@@ -63,13 +63,13 @@ Building an **Open Service Broker (OSB)** is complex. The specification defines 
 
 | Category | Tests | Spec Reference | Section |
 |----------|-------|----------------|---------|
-| Catalog | 5 | [GET /v2/catalog](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#get-v2catalog) | 3.1 |
-| Provision | 6 | [PUT /v2/service_instances/:id](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#put-v2service_instancesid) | 3.2 |
+| Catalog | 7 | [GET /v2/catalog](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#get-v2catalog) | 3.1 |
+| Provision | 7 | [PUT /v2/service_instances/:id](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#put-v2service_instancesid) | 3.2 |
 | Bind | 5 | [PUT /v2/service_instances/:id/service_bindings/:id](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#put-v2service_instancesidservice_bindingsid) | 3.3 |
 | Update | 3 | [PATCH /v2/service_instances/:id](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#patch-v2service_instancesid) | 3.4 |
 | Fetch | 5 | [GET endpoints](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#get-v2service_instancesid) | 3.5-3.7 |
 | Cleanup | 1+ | [DELETE endpoints](https://github.com/openservicebrokerapi/servicebroker/blob/v2.17/spec.md#deprovisioning) | 3.8 |
-| **Total** | **25+** | grows with the number of resources created | ✅ |
+| **Total** | **28+** | grows with the number of resources created | ✅ |
 
 Cleanup is reported, not silent: a broker that cannot deprovision what the run
 created shows up as a failure instead of a green report with leftovers.
