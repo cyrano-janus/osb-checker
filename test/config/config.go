@@ -44,6 +44,14 @@ type Config struct {
 	// dieselbe Instanz setzen.
 	IDPrefix string `yaml:"id_prefix"`
 
+	// UpdateParameter benennt einen Parameter, den der gepruefte Plan
+	// erlaubt, als "key=wert". Ohne die Angabe sondiert die Pruefung des
+	// Update-Pfads mit einem erfundenen Schluessel - ein Broker mit Allowlist
+	// lehnt den zu Recht ab, die Pruefung sagt dann nichts und wird
+	// uebersprungen. Wer den Pfad wirklich belegen will, nennt hier einen
+	// gueltigen Schluessel.
+	UpdateParameter string `yaml:"update_parameter"`
+
 	// TimeoutSeconds begrenzt jeden einzelnen HTTP-Request. Ohne Timeout
 	// haengt ein Lauf an einem stummen Broker unbegrenzt.
 	TimeoutSeconds int `yaml:"timeout_seconds"`

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/cyrano-janus/osb-checker/test/config"
@@ -161,18 +162,40 @@ func (s *TestSuite) cleanup(results *TestResults, state *TestState) {
 		fmt.Println("\nCleaning up test resources...")
 	}
 
+	// Der Statuscode zaehlt, nicht nur der Transport. Gemessen wurde hier
+	// allein `err != nil` - ein Broker, der beim Aufraeumen 500 antwortet,
+	// galt damit als aufgeraeumt. Zurueck bleiben Instanzen, fuer die niemand
+	// mehr zustaendig ist, und ein Bericht, der das Gegenteil behauptet.
+	//
+	// 200 und 410 gelten beide: 410 heisst "gibt es nicht mehr", und das ist
+	// genau das Ziel des Aufraeumens.
 	for _, b := range state.CreatedBindings {
-		if _, err := s.client.UnbindInstance(b.InstanceID, b.BindingID, state.ServiceID, state.PlanID); err != nil {
-			s.recordFailure(results, "Cleanup: unbind", "cleanup", err.Error(),
-				"/v2/service_instances/"+b.InstanceID+"/service_bindings/"+b.BindingID, "DELETE")
-		} else {
+		endpoint := "/v2/service_instances/" + b.InstanceID + "/service_bindings/" + b.BindingID
+		resp, err := s.client.UnbindInstance(b.InstanceID, b.BindingID, state.ServiceID, state.PlanID)
+		switch {
+		case err != nil:
+			s.recordFailure(results, "Cleanup: unbind", "cleanup", err.Error(), endpoint, "DELETE")
+		case !isGoneOrOK(resp.StatusCode):
+			s.recordFailure(results, "Cleanup: unbind", "cleanup",
+				fmt.Sprintf("expected 200 or 410, got %d - the binding may still exist", resp.StatusCode),
+				endpoint, "DELETE")
+		default:
 			s.recordSuccess(results, "Cleanup: unbind "+b.BindingID, "cleanup")
 		}
 	}
 
 	for _, id := range state.CreatedInstances {
-		if _, err := s.client.DeprovisionInstance(id, state.ServiceID, state.PlanID); err != nil {
+		resp, err := s.client.DeprovisionInstance(id, state.ServiceID, state.PlanID)
+		if err != nil {
 			s.recordFailure(results, "Cleanup: deprovision", "cleanup", err.Error(),
+				"/v2/service_instances/"+id, "DELETE")
+			continue
+		}
+		// 202 ist erlaubt, wenn asynchron abgeraeumt wird - darauf wartet der
+		// Block unten.
+		if !isGoneOrOK(resp.StatusCode) && resp.StatusCode != 202 {
+			s.recordFailure(results, "Cleanup: deprovision", "cleanup",
+				fmt.Sprintf("expected 200, 202 or 410, got %d - the instance may still exist", resp.StatusCode),
 				"/v2/service_instances/"+id, "DELETE")
 			continue
 		}
@@ -249,6 +272,18 @@ func (s *TestSuite) failTransport(results *TestResults, testName, category strin
 // Vorher stand hier >= 400, der Kommentar sprach aber von 400-499: ein Broker,
 // der bei einer fehlenden service_id mit 500 abstuerzt, bestand den Test.
 func isClientError(status int) bool { return status >= 400 && status < 500 }
+
+// isGoneOrOK: erfolgreich abgeraeumt oder schon weg.
+func isGoneOrOK(status int) bool { return status == 200 || status == 410 }
+
+// expectsStatus prueft auf genau den Code, den die Spezifikation nennt, und
+// laesst jeden anderen 4xx nur als Hinweis durchgehen.
+//
+// isClientError allein genuegte nicht: "returns 400" und "returns 404" waren
+// damit nicht unterscheidbar. Ein Broker, der eine fehlende service_id mit 404
+// beantwortet, bestand eine Pruefung, die 400 im Namen traegt - und auf einer
+// Plattform, die 404 als "Instanz weg" liest, hat das Folgen.
+func expectsStatus(got, want int) bool { return got == want }
 
 // pickService waehlt Service und Plan.
 //
@@ -531,7 +566,7 @@ func (s *TestSuite) testProvisionMissingServiceID(results *TestResults, state *T
 	}
 
 	// Check if status code indicates error (400-499)
-	if isClientError(resp.StatusCode) {
+	if expectsStatus(resp.StatusCode, 400) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -564,7 +599,7 @@ func (s *TestSuite) testProvisionMissingPlanID(results *TestResults, state *Test
 		return
 	}
 
-	if isClientError(resp.StatusCode) {
+	if expectsStatus(resp.StatusCode, 400) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -759,7 +794,7 @@ func (s *TestSuite) testBindMissingServiceID(results *TestResults, state *TestSt
 		return
 	}
 
-	if resp != nil && isClientError(resp.StatusCode) {
+	if resp != nil && expectsStatus(resp.StatusCode, 400) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -795,7 +830,7 @@ func (s *TestSuite) testBindMissingPlanID(results *TestResults, state *TestState
 		return
 	}
 
-	if resp != nil && isClientError(resp.StatusCode) {
+	if resp != nil && expectsStatus(resp.StatusCode, 400) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -826,7 +861,7 @@ func (s *TestSuite) testBindNonExistentInstance(results *TestResults, state *Tes
 		return
 	}
 
-	if resp != nil && isClientError(resp.StatusCode) {
+	if resp != nil && expectsStatus(resp.StatusCode, 404) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -848,7 +883,7 @@ func (s *TestSuite) testBindNonExistentInstance(results *TestResults, state *Tes
 // Test helpers - Update tests
 
 func (s *TestSuite) testUpdateInstance(results *TestResults, state *TestState) {
-	testName := "Update instance returns 200 OK"
+	testName := "Update instance returns 200 OK (202 when async)"
 
 	if state.InstanceID == "" {
 		results.Skipped++
@@ -868,12 +903,23 @@ func (s *TestSuite) testUpdateInstance(results *TestResults, state *TestState) {
 		return
 	}
 
-	if resp.StatusCode != 200 {
+	// 202 ist erlaubt, sobald accepts_incomplete gesetzt ist: der Broker fuehrt
+	// das Update asynchron aus. Hier stand ein harter Vergleich auf 200 - ein
+	// konformer asynchroner Broker galt damit als fehlerhaft. Ein Werkzeug,
+	// das konformes Verhalten bemaengelt, ist genauso unbrauchbar wie eines,
+	// das eine Verletzung durchlaesst: beim ersten Fehlalarm hoert jemand auf
+	// hinzusehen.
+	okStatus := resp.StatusCode == 200 || (s.client.AcceptsAsync() && resp.StatusCode == 202)
+	if !okStatus {
+		want := "200"
+		if s.client.AcceptsAsync() {
+			want = "200 or 202"
+		}
 		results.Failed++
 		results.Failures = append(results.Failures, TestFailure{
 			TestName: testName,
 			Category: "update",
-			Error:    fmt.Sprintf("Expected status 200, got %d", resp.StatusCode),
+			Error:    fmt.Sprintf("Expected status %s, got %d", want, resp.StatusCode),
 			Endpoint: "/v2/service_instances/{instance_id}",
 			Method:   "PATCH",
 		})
@@ -906,13 +952,19 @@ func (s *TestSuite) testUpdateInstance(results *TestResults, state *TestState) {
 func (s *TestSuite) testUpdateParametersWithoutPlanID(results *TestResults, state *TestState) {
 	const testName = "Update with parameters and no plan_id is accepted and reported"
 	const category = "update"
-	const probeKey = "osbCheckerProbe"
 
 	if state.InstanceID == "" {
 		results.Skipped++
 		return
 	}
+
+	// Ohne Vorgabe: ein Schluessel, den kein Plan vorgibt. Ein Broker mit
+	// Allowlist lehnt den zu Recht ab - dann sagt die Pruefung nichts.
+	probeKey := "osbCheckerProbe"
 	probe := fmt.Sprintf("v%d", time.Now().UnixNano()%100000)
+	if k, v, ok := strings.Cut(s.config.UpdateParameter, "="); ok && k != "" {
+		probeKey, probe = k, v
+	}
 
 	resp, err := s.client.UpdateInstanceParameters(state.InstanceID, state.ServiceID,
 		map[string]interface{}{probeKey: probe})
@@ -974,7 +1026,7 @@ func (s *TestSuite) testUpdateNonExistentInstance(results *TestResults, state *T
 		return
 	}
 
-	if resp != nil && isClientError(resp.StatusCode) {
+	if resp != nil && expectsStatus(resp.StatusCode, 404) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -1109,7 +1161,7 @@ func (s *TestSuite) testGetNonExistentInstance(results *TestResults, state *Test
 		return
 	}
 
-	if resp != nil && isClientError(resp.StatusCode) {
+	if resp != nil && expectsStatus(resp.StatusCode, 404) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,
@@ -1143,7 +1195,7 @@ func (s *TestSuite) testGetNonExistentBinding(results *TestResults, state *TestS
 		return
 	}
 
-	if resp != nil && isClientError(resp.StatusCode) {
+	if resp != nil && expectsStatus(resp.StatusCode, 404) {
 		results.Passed++
 		results.Successes = append(results.Successes, TestResult{
 			TestName: testName,

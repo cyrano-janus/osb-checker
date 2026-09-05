@@ -39,6 +39,13 @@ skip_services: []
 # gegen denselben Broker dürfen sich nicht auf dieselbe Instanz setzen.
 id_prefix: "osb-checker"
 
+# Ein Parameter, den der geprüfte Plan erlaubt, als "schluessel=wert". Ohne die
+# Angabe sondiert die Prüfung des Update-Pfads mit einem erfundenen Schlüssel;
+# ein Broker mit Allowlist lehnt den zu Recht ab, die Prüfung sagt dann nichts
+# und wird übersprungen. Wer den Pfad — `cf update-service -c` — wirklich
+# belegen will, nennt hier einen gültigen Schlüssel.
+update_parameter: ""
+
 # Zeitschranke je HTTP-Request. Ohne sie hängt ein Lauf an einem stummen
 # Broker unbegrenzt.
 timeout_seconds: 30

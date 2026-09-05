@@ -44,6 +44,10 @@ type mutation struct {
 	serviceWithoutDescription bool
 	updateNeedsPlanID         bool // PATCH ohne plan_id wird abgelehnt
 	updateDropsParams         bool // PATCH nimmt parameters an und verwirft sie
+	unbindStatus              int  // statt 200 - auch beim Aufraeumen
+	deprovisionStatus         int  // statt 200 - auch beim Aufraeumen
+	wrongClientErrorStatus    int  // 404 statt 400 bei fehlender service_id
+	updateAsyncStatus         int  // 202 statt 200 - im Async-Modus konform
 }
 
 type mockBroker struct {
@@ -133,7 +137,11 @@ func (b *mockBroker) instance(w http.ResponseWriter, r *http.Request, id string)
 		plan, _ := req["plan_id"].(string)
 
 		if svc == "" || plan == "" || (svc != mockRealService && svc != mockDemoService) {
-			writeJSON(w, b.status(b.mut.badRequestStatus, 400),
+			code := b.status(b.mut.badRequestStatus, 400)
+			if b.mut.wrongClientErrorStatus != 0 && (svc == "" || plan == "") {
+				code = b.mut.wrongClientErrorStatus
+			}
+			writeJSON(w, code,
 				map[string]string{"error": "BadRequest", "description": "service_id and plan_id are required"})
 			return
 		}
@@ -168,11 +176,15 @@ func (b *mockBroker) instance(w http.ResponseWriter, r *http.Request, id string)
 				b.params[id][k] = v
 			}
 		}
-		writeJSON(w, 200, map[string]interface{}{})
+		writeJSON(w, orMock(b.mut.updateAsyncStatus, 200), map[string]interface{}{"operation": "update"})
 
 	case http.MethodDelete:
 		if _, ok := b.instances[id]; !ok {
 			writeJSON(w, b.status(b.mut.deprovisionGoneCode, 410), map[string]interface{}{})
+			return
+		}
+		if b.mut.deprovisionStatus != 0 {
+			writeJSON(w, b.mut.deprovisionStatus, map[string]string{"error": "InternalServerError"})
 			return
 		}
 		delete(b.instances, id)
@@ -227,6 +239,10 @@ func (b *mockBroker) binding(w http.ResponseWriter, r *http.Request, instanceID,
 	case http.MethodDelete:
 		if _, ok := b.bindings[bindingID]; !ok {
 			writeJSON(w, 410, map[string]interface{}{})
+			return
+		}
+		if b.mut.unbindStatus != 0 {
+			writeJSON(w, b.mut.unbindStatus, map[string]string{"error": "InternalServerError"})
 			return
 		}
 		delete(b.bindings, bindingID)
@@ -369,6 +385,9 @@ func TestMock_JedeMutationWirdBemerkt(t *testing.T) {
 		{"Service ohne description", mutation{serviceWithoutDescription: true}, "required fields"},
 		{"PATCH ohne plan_id wird abgelehnt", mutation{updateNeedsPlanID: true}, "parameters"},
 		{"PATCH nimmt parameters an und verwirft sie", mutation{updateDropsParams: true}, "parameters"},
+		{"Deprovision antwortet 500 - auch beim Aufraeumen", mutation{deprovisionStatus: 500}, ""},
+		{"Unbind antwortet 500 - auch beim Aufraeumen", mutation{unbindStatus: 500}, ""},
+		{"fehlende service_id ergibt 404 statt 400", mutation{wrongClientErrorStatus: 404}, "service_id"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := withBroker(t, tc.mut)
@@ -381,6 +400,31 @@ func TestMock_JedeMutationWirdBemerkt(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Die Gegenrichtung einer Mutation: konformes Verhalten darf nicht als
+// Fehlschlag gebucht werden. Ein Broker, der ein Update asynchron ausfuehrt,
+// antwortet mit 202 - das ist erlaubt, sobald accepts_incomplete gesetzt ist,
+// und wurde hier als Fehlschlag gezaehlt.
+//
+// Ein Werkzeug, das konformes Verhalten bemaengelt, ist genauso unbrauchbar
+// wie eines, das eine Verletzung durchlaesst: beim ersten Fehlalarm hoert
+// jemand auf hinzusehen.
+func TestMock_AsynchronesUpdateIstKeinFehlschlag(t *testing.T) {
+	r := withBroker(t, mutation{updateAsyncStatus: 202})
+
+	for _, f := range r.Failures {
+		if strings.Contains(f.TestName, "Update instance") {
+			t.Fatalf("202 auf ein Update im Async-Modus ist konform, wurde aber bemaengelt: %s", f.Error)
+		}
+	}
+}
+
+func orMock(v, def int) int {
+	if v == 0 {
+		return def
+	}
+	return v
 }
 
 func TestMock_GeschlossenerServerLaesstNichtsDurchgehen(t *testing.T) {
